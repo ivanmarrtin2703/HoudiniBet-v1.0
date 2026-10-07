@@ -1,0 +1,30 @@
+{
+  "name": "houdini-bet",
+  "main": "src/index.js",
+  "compatibility_date": "2026-09-30",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+    "traces": { "enabled": true }
+  },
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/health"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "houdini-bet-db",
+      "database_id": "b6ee98e6-2397-45e5-83cb-33d1370656ae",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "triggers": {
+    "crons": ["0 6 * * *", "30 6 * * *"]
+  },
+  "vars": {
+    "LEAGUE_IDS": "140,141,39,135,78,61,5,2,3"
+  }
+}

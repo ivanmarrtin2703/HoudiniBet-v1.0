@@ -1,0 +1,1729 @@
+import { resolveTeamLogoUrl } from './services/teamLogos.js';
+import {
+  resolveTipOdds,
+  STAT_ODDS_BANDS,
+  oddsBandFromValue,
+  pickMarketForOddsBand,
+  pickLegForCombo,
+} from './services/oddsBands.js';
+import { buildCombos, comboOptsForBand } from './services/combos.js';
+import { ALLOWED_LEAGUE_SQL } from './services/leagueAllowlist.js';
+
+/** @param {D1Database} db */
+export function createDb(db) {
+  return {
+    raw: db,
+    async all(sql, ...params) {
+      const { results } = await db.prepare(sql).bind(...params).all();
+      return results || [];
+    },
+    async first(sql, ...params) {
+      return db.prepare(sql).bind(...params).first();
+    },
+    async run(sql, ...params) {
+      return db.prepare(sql).bind(...params).run();
+    },
+    /** One subrequest for many statements (D1 batch). */
+    async batch(items) {
+      if (!items.length) return [];
+      const stmts = items.map(({ sql, params = [] }) => db.prepare(sql).bind(...params));
+      return db.batch(stmts);
+    },
+  };
+}
+
+const MATCH_SELECT = `
+  SELECT m.*,
+    l.name AS league_name,
+    l.country AS league_country,
+    ht.name AS home_name, ht.logo_url AS home_logo, ht.id AS home_team_id,
+    at.name AS away_name, at.logo_url AS away_logo, at.id AS away_team_id
+  FROM matches m
+  JOIN leagues l ON l.id = m.league_id
+  JOIN teams ht ON ht.id = m.home_team_id
+  JOIN teams at ON at.id = m.away_team_id
+`;
+
+export function mapMatch(row) {
+  if (!row) return null;
+  const homeName = row.home_name;
+  const awayName = row.away_name;
+  return {
+    id: row.id,
+    leagueId: row.league_id,
+    leagueName: row.league_name,
+    leagueCountry: row.league_country || null,
+    matchDate: row.match_date,
+    status: row.status,
+    homeGoals: row.home_goals,
+    awayGoals: row.away_goals,
+    elapsedMinute: row.elapsed_minute != null ? Number(row.elapsed_minute) : null,
+    apiId: row.api_id,
+    homeTeam: {
+      id: row.home_team_id,
+      name: homeName,
+      logo: resolveTeamLogoUrl(homeName, row.home_logo),
+    },
+    awayTeam: {
+      id: row.away_team_id,
+      name: awayName,
+      logo: resolveTeamLogoUrl(awayName, row.away_logo),
+    },
+  };
+}
+
+/** Exclude inventados del seed (scheduled demo api_ids). */
+const EXCLUDE_DEMO_SCHEDULED = `
+  AND NOT (
+    status = 'scheduled'
+    AND (
+      (api_id >= 910100 AND api_id < 920000)
+      OR (api_id >= 920000 AND api_id < 920100)
+    )
+  )`;
+
+const EXCLUDE_DEMO_SCHEDULED_M = `
+  AND NOT (
+    m.status = 'scheduled'
+    AND (
+      (m.api_id >= 910100 AND m.api_id < 920000)
+      OR (m.api_id >= 920000 AND m.api_id < 920100)
+    )
+  )`;
+
+export async function getToday(db, leagueId = null) {
+  return getUpcoming(db, 0, leagueId);
+}
+
+/** Partidos from today through today+days (inclusive). Default 14. */
+export async function getUpcoming(db, days = 14, leagueId = null) {
+  const endModifier = `+${Number(days)} days`;
+  let sql = `${MATCH_SELECT}
+    WHERE date(m.match_date) >= date('now')
+      AND date(m.match_date) <= date('now', ?)
+      AND m.status IN ('scheduled', 'live')
+      ${EXCLUDE_DEMO_SCHEDULED_M}
+      ${ALLOWED_LEAGUE_SQL}`;
+  const params = [endModifier];
+  if (leagueId) {
+    sql += ' AND m.league_id = ?';
+    params.push(leagueId);
+  }
+  sql += ' ORDER BY m.match_date ASC';
+  const rows = await db.all(sql, ...params);
+  return rows.map(mapMatch);
+}
+
+/** Partidos de un día concreto (YYYY-MM-DD). */
+export async function getByDate(db, dateYmd, leagueId = null) {
+  let sql = `${MATCH_SELECT}
+    WHERE date(m.match_date) = date(?)
+      AND m.status IN ('scheduled', 'live')
+      ${EXCLUDE_DEMO_SCHEDULED_M}
+      ${ALLOWED_LEAGUE_SQL}`;
+  const params = [dateYmd];
+  if (leagueId) {
+    sql += ' AND m.league_id = ?';
+    params.push(leagueId);
+  }
+  sql += ' ORDER BY m.match_date ASC';
+  const rows = await db.all(sql, ...params);
+  return rows.map(mapMatch);
+}
+
+export async function getScheduledIdsOnDate(db, dateYmd) {
+  const rows = await db.all(
+    `SELECT m.id FROM matches m
+     JOIN leagues l ON l.id = m.league_id
+     WHERE date(m.match_date) = date(?)
+       AND m.status IN ('scheduled', 'live')
+       ${EXCLUDE_DEMO_SCHEDULED_M}
+       ${ALLOWED_LEAGUE_SQL}
+     ORDER BY m.match_date ASC`,
+    dateYmd
+  );
+  return rows.map((r) => r.id);
+}
+
+export async function findMatchById(db, id) {
+  const row = await db.first(`${MATCH_SELECT} WHERE m.id = ?`, id);
+  return mapMatch(row);
+}
+
+export async function getScheduledTodayIds(db) {
+  return getScheduledUpcomingIds(db, 14);
+}
+
+export async function getScheduledUpcomingIds(db, days = 14) {
+  const endModifier = `+${Number(days)} days`;
+  const rows = await db.all(
+    `SELECT m.id FROM matches m
+     JOIN leagues l ON l.id = m.league_id
+     WHERE date(m.match_date) >= date('now')
+       AND date(m.match_date) <= date('now', ?)
+       AND m.status IN ('scheduled', 'live')
+       ${EXCLUDE_DEMO_SCHEDULED_M}
+       ${ALLOWED_LEAGUE_SQL}
+     ORDER BY m.match_date ASC`,
+    endModifier
+  );
+  return rows.map((r) => r.id);
+}
+
+export async function getNextForTeam(db, teamId) {
+  const row = await db.first(
+    `${MATCH_SELECT}
+     WHERE (m.home_team_id = ? OR m.away_team_id = ?)
+       AND m.status IN ('scheduled', 'live')
+       AND m.match_date >= datetime('now')
+       ${EXCLUDE_DEMO_SCHEDULED_M}
+       ${ALLOWED_LEAGUE_SQL}
+     ORDER BY m.match_date ASC
+     LIMIT 1`,
+    teamId,
+    teamId
+  );
+  return mapMatch(row);
+}
+
+export async function listLeagues(db) {
+  return db.all(
+    `SELECT * FROM leagues l
+     WHERE 1=1 ${ALLOWED_LEAGUE_SQL}
+     ORDER BY name`
+  );
+}
+
+export async function searchTeams(db, q, limit = 15) {
+  return db.all(
+    `SELECT t.*, l.name AS league_name
+     FROM teams t JOIN leagues l ON l.id = t.league_id
+     WHERE t.name LIKE ?
+     ORDER BY t.name LIMIT ?`,
+    `%${q}%`,
+    limit
+  );
+}
+
+export async function findTeamById(db, id) {
+  return db.first(
+    `SELECT t.*, l.name AS league_name
+     FROM teams t JOIN leagues l ON l.id = t.league_id
+     WHERE t.id = ?`,
+    id
+  );
+}
+
+export async function lastNForTeam(db, teamId, n = 5) {
+  return db.all(
+    `SELECT * FROM team_stats WHERE team_id = ? ORDER BY match_date DESC LIMIT ?`,
+    teamId,
+    n
+  );
+}
+
+export async function leagueGoalAverages(db, leagueId) {
+  const r = await db.first(
+    `SELECT
+       AVG(CASE WHEN ts.is_home = 1 THEN ts.goals_scored END) AS avg_home_scored,
+       AVG(CASE WHEN ts.is_home = 0 THEN ts.goals_scored END) AS avg_away_scored,
+       AVG(ts.goals_scored) AS avg_scored,
+       AVG(ts.goals_conceded) AS avg_conceded,
+       AVG(ts.corners_for) AS avg_corners_for,
+       AVG(ts.corners_against) AS avg_corners_against,
+       AVG(ts.yellows_for) AS avg_yellows_for,
+       AVG(ts.yellows_against) AS avg_yellows_against
+     FROM team_stats ts
+     JOIN matches m ON m.id = ts.match_id
+     WHERE m.league_id = ?`,
+    leagueId
+  );
+  return {
+    avgHomeScored: Number(r?.avg_home_scored) || 1.35,
+    avgAwayScored: Number(r?.avg_away_scored) || 1.15,
+    avgScored: Number(r?.avg_scored) || 1.25,
+    avgConceded: Number(r?.avg_conceded) || 1.25,
+    avgCornersFor: Number(r?.avg_corners_for) || 5.0,
+    avgCornersAgainst: Number(r?.avg_corners_against) || 5.0,
+    avgYellowsFor: Number(r?.avg_yellows_for) || 2.0,
+    avgYellowsAgainst: Number(r?.avg_yellows_against) || 2.0,
+  };
+}
+
+export function formFromStats(stats) {
+  return (stats || []).map((s) => {
+    if (s.goals_scored > s.goals_conceded) return 'W';
+    if (s.goals_scored < s.goals_conceded) return 'L';
+    return 'D';
+  });
+}
+
+export async function upsertLeague(db, { name, country, logo_url, api_id }) {
+  const existing = await db.first('SELECT id FROM leagues WHERE api_id = ?', api_id);
+  if (existing) {
+    await db.run(
+      'UPDATE leagues SET name = ?, country = ?, logo_url = COALESCE(?, logo_url) WHERE api_id = ?',
+      name,
+      country,
+      logo_url,
+      api_id
+    );
+    return existing.id;
+  }
+  const res = await db.run(
+    'INSERT INTO leagues (name, country, logo_url, api_id) VALUES (?, ?, ?, ?)',
+    name,
+    country,
+    logo_url,
+    api_id
+  );
+  return res.meta.last_row_id;
+}
+
+export async function upsertTeam(db, { name, logo_url, league_id, api_id }) {
+  const existing = await db.first('SELECT id FROM teams WHERE api_id = ?', api_id);
+  if (existing) {
+    await db.run(
+      'UPDATE teams SET name = ?, logo_url = COALESCE(?, logo_url), league_id = ? WHERE api_id = ?',
+      name,
+      logo_url,
+      league_id,
+      api_id
+    );
+    return existing.id;
+  }
+  const res = await db.run(
+    'INSERT INTO teams (name, logo_url, league_id, api_id) VALUES (?, ?, ?, ?)',
+    name,
+    logo_url,
+    league_id,
+    api_id
+  );
+  return res.meta.last_row_id;
+}
+
+export async function upsertFixture(db, f) {
+  const existing = await db.first('SELECT id FROM matches WHERE api_id = ?', f.api_id);
+  const elapsed =
+    f.elapsed_minute != null && !Number.isNaN(Number(f.elapsed_minute))
+      ? Number(f.elapsed_minute)
+      : null;
+  if (existing) {
+    await db.run(
+      `UPDATE matches SET league_id=?, home_team_id=?, away_team_id=?, match_date=?,
+       status=?, home_goals=?, away_goals=?,
+       elapsed_minute=COALESCE(?, elapsed_minute) WHERE api_id=?`,
+      f.league_id,
+      f.home_team_id,
+      f.away_team_id,
+      f.match_date,
+      f.status,
+      f.home_goals,
+      f.away_goals,
+      elapsed,
+      f.api_id
+    );
+    return existing.id;
+  }
+  const res = await db.run(
+    `INSERT INTO matches
+      (league_id, home_team_id, away_team_id, match_date, status, home_goals, away_goals, elapsed_minute, api_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    f.league_id,
+    f.home_team_id,
+    f.away_team_id,
+    f.match_date,
+    f.status,
+    f.home_goals,
+    f.away_goals,
+    elapsed,
+    f.api_id
+  );
+  return res.meta.last_row_id;
+}
+
+/** Update live/finished fields by api_id (no team remapping). */
+export async function updateMatchLiveByApiId(db, apiId, { status, home_goals, away_goals, elapsed_minute }) {
+  await db.run(
+    `UPDATE matches SET
+       status = COALESCE(?, status),
+       home_goals = COALESCE(?, home_goals),
+       away_goals = COALESCE(?, away_goals),
+       elapsed_minute = ?
+     WHERE api_id = ?`,
+    status ?? null,
+    home_goals ?? null,
+    away_goals ?? null,
+    elapsed_minute ?? null,
+    apiId
+  );
+}
+
+/** Update live fields by internal match id. */
+export async function updateMatchLiveById(db, matchId, { status, home_goals, away_goals, elapsed_minute }) {
+  await db.run(
+    `UPDATE matches SET
+       status = COALESCE(?, status),
+       home_goals = COALESCE(?, home_goals),
+       away_goals = COALESCE(?, away_goals),
+       elapsed_minute = ?
+     WHERE id = ?`,
+    status ?? null,
+    home_goals ?? null,
+    away_goals ?? null,
+    elapsed_minute ?? null,
+    matchId
+  );
+}
+
+export async function upsertStat(db, s) {
+  await db.run(
+    `INSERT INTO team_stats
+      (team_id, match_id, goals_scored, goals_conceded, corners_for, corners_against,
+       yellows_for, yellows_against, reds_for, reds_against, fouls_for, fouls_against,
+       shots_for, shots_against, is_home, match_date)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(match_id, team_id) DO UPDATE SET
+       goals_scored = excluded.goals_scored,
+       goals_conceded = excluded.goals_conceded,
+       corners_for = COALESCE(excluded.corners_for, team_stats.corners_for),
+       corners_against = COALESCE(excluded.corners_against, team_stats.corners_against),
+       yellows_for = COALESCE(excluded.yellows_for, team_stats.yellows_for),
+       yellows_against = COALESCE(excluded.yellows_against, team_stats.yellows_against),
+       reds_for = COALESCE(excluded.reds_for, team_stats.reds_for),
+       reds_against = COALESCE(excluded.reds_against, team_stats.reds_against),
+       fouls_for = COALESCE(excluded.fouls_for, team_stats.fouls_for),
+       fouls_against = COALESCE(excluded.fouls_against, team_stats.fouls_against),
+       shots_for = COALESCE(excluded.shots_for, team_stats.shots_for),
+       shots_against = COALESCE(excluded.shots_against, team_stats.shots_against),
+       is_home = excluded.is_home,
+       match_date = excluded.match_date`,
+    s.team_id,
+    s.match_id,
+    s.goals_scored,
+    s.goals_conceded,
+    s.corners_for ?? null,
+    s.corners_against ?? null,
+    s.yellows_for ?? null,
+    s.yellows_against ?? null,
+    s.reds_for ?? null,
+    s.reds_against ?? null,
+    s.fouls_for ?? null,
+    s.fouls_against ?? null,
+    s.shots_for ?? null,
+    s.shots_against ?? null,
+    s.is_home ? 1 : 0,
+    s.match_date
+  );
+}
+
+export async function upsertPrediction(db, p) {
+  await db.run(
+    `INSERT INTO predictions (
+      match_id, home_win_prob, draw_prob, away_win_prob,
+      over15_prob, under15_prob, over25_prob, under25_prob, over35_prob, under35_prob,
+      btts_yes_prob, btts_no_prob,
+      home_over05_prob, home_under05_prob, home_over15_prob, home_under15_prob,
+      home_over25_prob, home_under25_prob, home_over35_prob, home_under35_prob,
+      away_over05_prob, away_under05_prob, away_over15_prob, away_under15_prob,
+      away_over25_prob, away_under25_prob, away_over35_prob, away_under35_prob,
+      corners_over85_prob, corners_under85_prob,
+      corners_over95_prob, corners_under95_prob,
+      corners_over105_prob, corners_under105_prob,
+      cards_over35_prob, cards_under35_prob, cards_over45_prob, cards_under45_prob,
+      suggested_bet, secondary_bet, confidence_score, value_edge, value_market
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(match_id) DO UPDATE SET
+      home_win_prob = excluded.home_win_prob,
+      draw_prob = excluded.draw_prob,
+      away_win_prob = excluded.away_win_prob,
+      over15_prob = excluded.over15_prob,
+      under15_prob = excluded.under15_prob,
+      over25_prob = excluded.over25_prob,
+      under25_prob = excluded.under25_prob,
+      over35_prob = excluded.over35_prob,
+      under35_prob = excluded.under35_prob,
+      btts_yes_prob = excluded.btts_yes_prob,
+      btts_no_prob = excluded.btts_no_prob,
+      home_over05_prob = excluded.home_over05_prob,
+      home_under05_prob = excluded.home_under05_prob,
+      home_over15_prob = excluded.home_over15_prob,
+      home_under15_prob = excluded.home_under15_prob,
+      home_over25_prob = excluded.home_over25_prob,
+      home_under25_prob = excluded.home_under25_prob,
+      home_over35_prob = excluded.home_over35_prob,
+      home_under35_prob = excluded.home_under35_prob,
+      away_over05_prob = excluded.away_over05_prob,
+      away_under05_prob = excluded.away_under05_prob,
+      away_over15_prob = excluded.away_over15_prob,
+      away_under15_prob = excluded.away_under15_prob,
+      away_over25_prob = excluded.away_over25_prob,
+      away_under25_prob = excluded.away_under25_prob,
+      away_over35_prob = excluded.away_over35_prob,
+      away_under35_prob = excluded.away_under35_prob,
+      corners_over85_prob = excluded.corners_over85_prob,
+      corners_under85_prob = excluded.corners_under85_prob,
+      corners_over95_prob = excluded.corners_over95_prob,
+      corners_under95_prob = excluded.corners_under95_prob,
+      corners_over105_prob = excluded.corners_over105_prob,
+      corners_under105_prob = excluded.corners_under105_prob,
+      cards_over35_prob = excluded.cards_over35_prob,
+      cards_under35_prob = excluded.cards_under35_prob,
+      cards_over45_prob = excluded.cards_over45_prob,
+      cards_under45_prob = excluded.cards_under45_prob,
+      suggested_bet = excluded.suggested_bet,
+      secondary_bet = excluded.secondary_bet,
+      confidence_score = excluded.confidence_score,
+      value_edge = excluded.value_edge,
+      value_market = excluded.value_market,
+      created_at = datetime('now')`,
+    p.match_id,
+    p.home_win_prob,
+    p.draw_prob,
+    p.away_win_prob,
+    p.over15_prob,
+    p.under15_prob,
+    p.over25_prob,
+    p.under25_prob,
+    p.over35_prob,
+    p.under35_prob,
+    p.btts_yes_prob,
+    p.btts_no_prob,
+    p.home_over05_prob,
+    p.home_under05_prob,
+    p.home_over15_prob,
+    p.home_under15_prob,
+    p.home_over25_prob,
+    p.home_under25_prob,
+    p.home_over35_prob,
+    p.home_under35_prob,
+    p.away_over05_prob,
+    p.away_under05_prob,
+    p.away_over15_prob,
+    p.away_under15_prob,
+    p.away_over25_prob,
+    p.away_under25_prob,
+    p.away_over35_prob,
+    p.away_under35_prob,
+    p.corners_over85_prob,
+    p.corners_under85_prob,
+    p.corners_over95_prob,
+    p.corners_under95_prob,
+    p.corners_over105_prob,
+    p.corners_under105_prob,
+    p.cards_over35_prob,
+    p.cards_under35_prob,
+    p.cards_over45_prob,
+    p.cards_under45_prob,
+    p.suggested_bet,
+    p.secondary_bet,
+    p.confidence_score,
+    p.value_edge,
+    p.value_market
+  );
+}
+
+export async function getPredictionByMatchId(db, matchId) {
+  return db.first('SELECT * FROM predictions WHERE match_id = ?', matchId);
+}
+
+/** @returns {Promise<Map<number, object>>} */
+export async function getPredictionsByMatchIds(db, matchIds) {
+  const map = new Map();
+  const ids = [...new Set((matchIds || []).map(Number).filter((id) => id > 0))];
+  if (!ids.length) return map;
+  const CHUNK = 80;
+  for (let i = 0; i < ids.length; i += CHUNK) {
+    const slice = ids.slice(i, i + CHUNK);
+    const ph = slice.map(() => '?').join(',');
+    const rows = await db.all(`SELECT * FROM predictions WHERE match_id IN (${ph})`, ...slice);
+    for (const r of rows) map.set(Number(r.match_id), r);
+  }
+  return map;
+}
+
+export async function getBestBets(db, limit = 3, days = 14) {
+  const endModifier = `+${Number(days)} days`;
+  return db.all(
+    `SELECT p.*,
+       m.match_date, m.status, m.league_id,
+       l.name AS league_name,
+       l.country AS league_country,
+       ht.name AS home_name, ht.logo_url AS home_logo,
+       at.name AS away_name, at.logo_url AS away_logo,
+       o.home_odds, o.draw_odds, o.away_odds, o.over25_odds, o.under25_odds
+     FROM predictions p
+     JOIN matches m ON m.id = p.match_id
+     JOIN leagues l ON l.id = m.league_id
+     JOIN teams ht ON ht.id = m.home_team_id
+     JOIN teams at ON at.id = m.away_team_id
+     LEFT JOIN odds o ON o.match_id = m.id
+     WHERE date(m.match_date) >= date('now')
+       AND date(m.match_date) <= date('now', ?)
+       AND m.status IN ('scheduled', 'live')
+       ${EXCLUDE_DEMO_SCHEDULED_M}
+       ${ALLOWED_LEAGUE_SQL}
+       AND p.confidence_score IS NOT NULL
+     ORDER BY p.confidence_score DESC, p.value_edge DESC
+     LIMIT ?`,
+    endModifier,
+    limit
+  );
+}
+
+export async function getBestBetsOnDate(db, dateYmd, limit = 3) {
+  return db.all(
+    `SELECT p.*,
+       m.match_date, m.status, m.league_id,
+       l.name AS league_name,
+       l.country AS league_country,
+       ht.name AS home_name, ht.logo_url AS home_logo,
+       at.name AS away_name, at.logo_url AS away_logo,
+       o.home_odds, o.draw_odds, o.away_odds, o.over25_odds, o.under25_odds
+     FROM predictions p
+     JOIN matches m ON m.id = p.match_id
+     JOIN leagues l ON l.id = m.league_id
+     JOIN teams ht ON ht.id = m.home_team_id
+     JOIN teams at ON at.id = m.away_team_id
+     LEFT JOIN odds o ON o.match_id = m.id
+     WHERE date(m.match_date) = date(?)
+       AND m.status IN ('scheduled', 'live')
+       ${EXCLUDE_DEMO_SCHEDULED_M}
+       ${ALLOWED_LEAGUE_SQL}
+       AND p.confidence_score IS NOT NULL
+     ORDER BY p.confidence_score DESC, p.value_edge DESC
+     LIMIT ?`,
+    dateYmd,
+    limit
+  );
+}
+
+/** Matches for live refresh matching (today, scheduled/live). */
+export async function getTodayMatchesForLiveRefresh(db) {
+  return db.all(
+    `SELECT m.id, m.api_id, m.match_date, m.status, m.home_goals, m.away_goals,
+            l.api_id AS league_api_id, l.name AS league_name,
+            ht.name AS home_name, at.name AS away_name
+     FROM matches m
+     JOIN leagues l ON l.id = m.league_id
+     JOIN teams ht ON ht.id = m.home_team_id
+     JOIN teams at ON at.id = m.away_team_id
+     WHERE date(m.match_date) = date('now')
+       AND m.status IN ('scheduled', 'live')
+       ${EXCLUDE_DEMO_SCHEDULED_M}
+     ORDER BY m.match_date ASC`
+  );
+}
+
+export async function upsertOdds(db, o) {
+  await db.run(
+    `INSERT INTO odds (match_id, bookmaker, home_odds, draw_odds, away_odds, over25_odds, under25_odds, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+     ON CONFLICT(match_id, bookmaker) DO UPDATE SET
+       home_odds = excluded.home_odds,
+       draw_odds = excluded.draw_odds,
+       away_odds = excluded.away_odds,
+       over25_odds = excluded.over25_odds,
+       under25_odds = excluded.under25_odds,
+       updated_at = datetime('now')`,
+    o.match_id,
+    o.bookmaker || 'avg',
+    o.home_odds,
+    o.draw_odds,
+    o.away_odds,
+    o.over25_odds,
+    o.under25_odds
+  );
+}
+
+export async function getOddsForMatch(db, matchId) {
+  return db.first('SELECT * FROM odds WHERE match_id = ? LIMIT 1', matchId);
+}
+
+/** @returns {Promise<Map<number, object>>} */
+export async function getOddsByMatchIds(db, matchIds) {
+  const map = new Map();
+  const ids = [...new Set((matchIds || []).map(Number).filter((id) => id > 0))];
+  if (!ids.length) return map;
+  const CHUNK = 80;
+  for (let i = 0; i < ids.length; i += CHUNK) {
+    const slice = ids.slice(i, i + CHUNK);
+    const ph = slice.map(() => '?').join(',');
+    const rows = await db.all(`SELECT * FROM odds WHERE match_id IN (${ph})`, ...slice);
+    for (const r of rows) map.set(Number(r.match_id), r);
+  }
+  return map;
+}
+
+/** Prefer existing team by name in league (avoids duplicate Portugal etc. after FD sync). */
+export async function upsertTeamByName(db, { name, logo_url, league_id, api_id }) {
+  const byName = await db.first(
+    'SELECT id FROM teams WHERE league_id = ? AND lower(name) = lower(?)',
+    league_id,
+    name
+  );
+  if (byName) return byName.id;
+  return upsertTeam(db, { name, logo_url, league_id, api_id });
+}
+
+/**
+ * Remove all demo-seed fixtures (scheduled + finished inventados).
+ * api_id 910000–929999 from migrations 0002/0003.
+ */
+export async function deleteAllDemoMatches(db) {
+  const result = await db.run(
+    `DELETE FROM matches WHERE api_id >= 910000 AND api_id < 930000`
+  );
+  return Number(result?.meta?.changes || 0);
+}
+
+/** @deprecated use deleteAllDemoMatches */
+export async function deleteDemoScheduledMatches(db) {
+  return deleteAllDemoMatches(db);
+}
+
+export async function clearPredictions(db) {
+  const result = await db.run('DELETE FROM predictions');
+  return Number(result?.meta?.changes || 0);
+}
+
+/** Drop predictions whose match no longer exists (keeps cache across sync). */
+export async function purgeOrphanPredictions(db) {
+  const result = await db.run(
+    `DELETE FROM predictions WHERE match_id NOT IN (SELECT id FROM matches)`
+  );
+  return Number(result?.meta?.changes || 0);
+}
+
+/**
+ * Rebuild team_stats goals for finished FD matches.
+ * Does not wipe corners/yellows already filled by API-Football enrich.
+ */
+export async function rebuildFdTeamStats(db) {
+  await db.run(
+    `INSERT INTO team_stats
+      (team_id, match_id, goals_scored, goals_conceded, corners_for, corners_against,
+       yellows_for, yellows_against, is_home, match_date)
+     SELECT m.home_team_id, m.id, m.home_goals, m.away_goals, NULL, NULL, NULL, NULL, 1, m.match_date
+     FROM matches m
+     WHERE m.status = 'finished'
+       AND m.api_id >= 820000000
+       AND m.home_goals IS NOT NULL
+       AND m.away_goals IS NOT NULL
+     ON CONFLICT(match_id, team_id) DO UPDATE SET
+       goals_scored = excluded.goals_scored,
+       goals_conceded = excluded.goals_conceded,
+       match_date = excluded.match_date`
+  );
+  await db.run(
+    `INSERT INTO team_stats
+      (team_id, match_id, goals_scored, goals_conceded, corners_for, corners_against,
+       yellows_for, yellows_against, is_home, match_date)
+     SELECT m.away_team_id, m.id, m.away_goals, m.home_goals, NULL, NULL, NULL, NULL, 0, m.match_date
+     FROM matches m
+     WHERE m.status = 'finished'
+       AND m.api_id >= 820000000
+       AND m.home_goals IS NOT NULL
+       AND m.away_goals IS NOT NULL
+     ON CONFLICT(match_id, team_id) DO UPDATE SET
+       goals_scored = excluded.goals_scored,
+       goals_conceded = excluded.goals_conceded,
+       match_date = excluded.match_date`
+  );
+  const row = await db.first(
+    `SELECT COUNT(*) AS c FROM team_stats ts
+     JOIN matches m ON m.id = ts.match_id
+     WHERE m.api_id >= 820000000 AND m.status = 'finished'`
+  );
+  return Number(row?.c || 0);
+}
+
+export async function countFixtureDownloadMatches(db, days = 14) {
+  const endModifier = `+${Number(days)} days`;
+  const row = await db.first(
+    `SELECT COUNT(*) AS c FROM matches
+     WHERE api_id >= 820000000
+       AND date(match_date) >= date('now')
+       AND date(match_date) <= date('now', ?)
+       AND status IN ('scheduled', 'live')`,
+    endModifier
+  );
+  return Number(row?.c || 0);
+}
+
+export async function getMeta(db, key) {
+  const row = await db.first('SELECT value FROM meta WHERE key = ?', key);
+  return row?.value ?? null;
+}
+
+export async function setMeta(db, key, value) {
+  await db.run(
+    `INSERT INTO meta (key, value, updated_at) VALUES (?, ?, datetime('now'))
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`,
+    key,
+    value == null ? '' : String(value)
+  );
+}
+
+/** Snapshot tip for hit tracking. Only updates pending rows (keeps settled history). */
+export async function upsertTipResult(db, tip) {
+  const modelProb =
+    tip.model_prob != null && Number(tip.model_prob) > 0
+      ? Number(tip.model_prob)
+      : tip.confidence_score != null && Number(tip.confidence_score) > 0
+        ? Number(tip.confidence_score) > 1
+          ? Number(tip.confidence_score) / 100
+          : Number(tip.confidence_score)
+        : null;
+  await db.run(
+    `INSERT INTO tip_results (
+       match_id, suggested_bet, confidence_score, value_edge, value_market,
+       tip_odds, odds_band, model_prob, outcome
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+     ON CONFLICT(match_id) DO UPDATE SET
+       suggested_bet = CASE WHEN tip_results.outcome = 'pending' THEN excluded.suggested_bet ELSE tip_results.suggested_bet END,
+       confidence_score = CASE WHEN tip_results.outcome = 'pending' THEN excluded.confidence_score ELSE tip_results.confidence_score END,
+       value_edge = CASE WHEN tip_results.outcome = 'pending' THEN excluded.value_edge ELSE tip_results.value_edge END,
+       value_market = CASE WHEN tip_results.outcome = 'pending' THEN excluded.value_market ELSE tip_results.value_market END,
+       tip_odds = CASE WHEN tip_results.outcome = 'pending' THEN excluded.tip_odds ELSE tip_results.tip_odds END,
+       odds_band = CASE WHEN tip_results.outcome = 'pending' THEN excluded.odds_band ELSE tip_results.odds_band END,
+       model_prob = CASE WHEN tip_results.outcome = 'pending' THEN excluded.model_prob ELSE tip_results.model_prob END`,
+    tip.match_id,
+    tip.suggested_bet,
+    tip.confidence_score,
+    tip.value_edge,
+    tip.value_market,
+    tip.tip_odds ?? null,
+    tip.odds_band ?? null,
+    modelProb
+  );
+}
+
+export function evaluateSuggestedBet(bet, homeGoals, awayGoals, extras = {}) {
+  const h = Number(homeGoals);
+  const a = Number(awayGoals);
+  if (Number.isNaN(h) || Number.isNaN(a)) return null;
+  switch (bet) {
+    case 'HOME_WIN':
+      return h > a;
+    case 'DRAW':
+      return h === a;
+    case 'AWAY_WIN':
+      return h < a;
+    case 'OVER_15':
+      return h + a > 1;
+    case 'UNDER_15':
+      return h + a <= 1;
+    case 'OVER_25':
+      return h + a > 2;
+    case 'UNDER_25':
+      return h + a <= 2;
+    case 'OVER_35':
+      return h + a > 3;
+    case 'UNDER_35':
+      return h + a <= 3;
+    case 'BTTS_YES':
+      return h > 0 && a > 0;
+    case 'BTTS_NO':
+      return h === 0 || a === 0;
+    case 'HOME_OVER_05':
+      return h > 0;
+    case 'HOME_UNDER_05':
+      return h === 0;
+    case 'HOME_OVER_15':
+      return h > 1;
+    case 'HOME_UNDER_15':
+      return h <= 1;
+    case 'HOME_OVER_25':
+      return h > 2;
+    case 'HOME_UNDER_25':
+      return h <= 2;
+    case 'HOME_OVER_35':
+      return h > 3;
+    case 'HOME_UNDER_35':
+      return h <= 3;
+    case 'AWAY_OVER_05':
+      return a > 0;
+    case 'AWAY_UNDER_05':
+      return a === 0;
+    case 'AWAY_OVER_15':
+      return a > 1;
+    case 'AWAY_UNDER_15':
+      return a <= 1;
+    case 'AWAY_OVER_25':
+      return a > 2;
+    case 'AWAY_UNDER_25':
+      return a <= 2;
+    case 'AWAY_OVER_35':
+      return a > 3;
+    case 'AWAY_UNDER_35':
+      return a <= 3;
+    case 'CORNERS_OVER_85':
+      return extras.cornersTotal != null ? extras.cornersTotal > 8 : null;
+    case 'CORNERS_UNDER_85':
+      return extras.cornersTotal != null ? extras.cornersTotal <= 8 : null;
+    case 'CORNERS_OVER_95':
+      return extras.cornersTotal != null ? extras.cornersTotal > 9 : null;
+    case 'CORNERS_UNDER_95':
+      return extras.cornersTotal != null ? extras.cornersTotal <= 9 : null;
+    case 'CORNERS_OVER_105':
+      return extras.cornersTotal != null ? extras.cornersTotal > 10 : null;
+    case 'CORNERS_UNDER_105':
+      return extras.cornersTotal != null ? extras.cornersTotal <= 10 : null;
+    case 'CARDS_OVER_35':
+      return extras.yellowsTotal != null ? extras.yellowsTotal > 3 : null;
+    case 'CARDS_UNDER_35':
+      return extras.yellowsTotal != null ? extras.yellowsTotal <= 3 : null;
+    case 'CARDS_OVER_45':
+      return extras.yellowsTotal != null ? extras.yellowsTotal > 4 : null;
+    case 'CARDS_UNDER_45':
+      return extras.yellowsTotal != null ? extras.yellowsTotal <= 4 : null;
+    default:
+      return null;
+  }
+}
+
+/** Snapshot tips from predictions missing tip_results (upcoming + finished). */
+export async function backfillPendingTips(db, limit = 60) {
+  const rows = await db.all(
+    `SELECT p.*, o.home_odds, o.draw_odds, o.away_odds, o.over25_odds, o.under25_odds,
+            m.status AS match_status, m.home_goals AS m_home_goals, m.away_goals AS m_away_goals
+     FROM predictions p
+     JOIN matches m ON m.id = p.match_id
+     LEFT JOIN odds o ON o.match_id = m.id
+     WHERE p.suggested_bet IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM tip_results tr WHERE tr.match_id = p.match_id)
+       AND (
+         m.status IN ('scheduled', 'live')
+         OR (
+           m.status = 'finished'
+           AND m.home_goals IS NOT NULL
+           AND m.away_goals IS NOT NULL
+         )
+       )
+     ORDER BY CASE WHEN m.status = 'finished' THEN 0 ELSE 1 END, m.match_date DESC
+     LIMIT ?`,
+    Math.max(1, Number(limit) || 60)
+  );
+  let n = 0;
+  for (const r of rows) {
+    const resolved = resolveTipOdds(r.suggested_bet, r, r);
+    await upsertTipResult(db, {
+      match_id: r.match_id,
+      suggested_bet: r.suggested_bet,
+      confidence_score: r.confidence_score,
+      model_prob:
+        r.confidence_score != null && Number(r.confidence_score) > 1
+          ? Number(r.confidence_score) / 100
+          : r.confidence_score != null
+            ? Number(r.confidence_score)
+            : null,
+      value_edge: r.value_edge,
+      value_market: r.value_market,
+      tip_odds: resolved.tipOdds,
+      odds_band: resolved.oddsBand,
+    });
+    n += 1;
+  }
+  return n;
+}
+
+/** Fill tip_odds / odds_band on tip_results that are missing them. */
+export async function backfillTipOddsBands(db, limit = 80) {
+  const rows = await db.all(
+    `SELECT tr.id, tr.suggested_bet, tr.tip_odds AS existing_tip_odds, tr.odds_band AS existing_band,
+            p.home_win_prob, p.draw_prob, p.away_win_prob,
+            p.over15_prob, p.under15_prob, p.over25_prob, p.under25_prob,
+            p.over35_prob, p.under35_prob, p.btts_yes_prob, p.btts_no_prob,
+            p.home_over05_prob, p.home_under05_prob, p.home_over15_prob, p.home_under15_prob,
+            p.home_over25_prob, p.home_under25_prob, p.home_over35_prob, p.home_under35_prob,
+            p.away_over05_prob, p.away_under05_prob, p.away_over15_prob, p.away_under15_prob,
+            p.away_over25_prob, p.away_under25_prob, p.away_over35_prob, p.away_under35_prob,
+            p.corners_over85_prob, p.corners_under85_prob,
+            p.corners_over95_prob, p.corners_under95_prob,
+            p.corners_over105_prob, p.corners_under105_prob,
+            p.cards_over35_prob, p.cards_under35_prob, p.cards_over45_prob, p.cards_under45_prob,
+            o.home_odds, o.draw_odds, o.away_odds, o.over25_odds, o.under25_odds
+     FROM tip_results tr
+     LEFT JOIN predictions p ON p.match_id = tr.match_id
+     LEFT JOIN odds o ON o.match_id = tr.match_id
+     WHERE tr.tip_odds IS NULL OR tr.odds_band IS NULL
+     LIMIT ?`,
+    Math.max(1, Number(limit) || 80)
+  );
+  let n = 0;
+  for (const r of rows) {
+    const resolved = resolveTipOdds(r.suggested_bet, r, r);
+    const tipOdds =
+      r.existing_tip_odds != null && Number(r.existing_tip_odds) > 0
+        ? Number(r.existing_tip_odds)
+        : resolved.tipOdds;
+    const band =
+      r.existing_band ||
+      resolved.oddsBand ||
+      (tipOdds != null ? oddsBandFromValue(tipOdds) : null);
+    if (tipOdds == null && band == null) continue;
+    await db.run(
+      `UPDATE tip_results
+       SET tip_odds = COALESCE(tip_odds, ?),
+           odds_band = COALESCE(odds_band, ?)
+       WHERE id = ?`,
+      tipOdds,
+      band,
+      r.id
+    );
+    n += 1;
+  }
+  return n;
+}
+
+export async function settlePendingTips(db, limit = 80) {
+  const pending = await db.all(
+    `SELECT tr.id, tr.match_id, tr.suggested_bet, m.home_goals, m.away_goals, m.status
+     FROM tip_results tr
+     JOIN matches m ON m.id = tr.match_id
+     WHERE tr.outcome = 'pending'
+       AND m.status = 'finished'
+       AND m.home_goals IS NOT NULL
+       AND m.away_goals IS NOT NULL
+     LIMIT ?`,
+    Math.max(1, Number(limit) || 80)
+  );
+  let settled = 0;
+  for (const row of pending) {
+    const homeStat = await db.first(
+      `SELECT corners_for, yellows_for FROM team_stats WHERE match_id = ? AND is_home = 1`,
+      row.match_id
+    );
+    const awayStat = await db.first(
+      `SELECT corners_for, yellows_for FROM team_stats WHERE match_id = ? AND is_home = 0`,
+      row.match_id
+    );
+    let cornersTotal = null;
+    let yellowsTotal = null;
+    if (homeStat?.corners_for != null && awayStat?.corners_for != null) {
+      cornersTotal = Number(homeStat.corners_for) + Number(awayStat.corners_for);
+    }
+    if (homeStat?.yellows_for != null && awayStat?.yellows_for != null) {
+      yellowsTotal = Number(homeStat.yellows_for) + Number(awayStat.yellows_for);
+    }
+    const hit = evaluateSuggestedBet(row.suggested_bet, row.home_goals, row.away_goals, {
+      cornersTotal,
+      yellowsTotal,
+    });
+    const outcome = hit == null ? 'void' : hit ? 'hit' : 'miss';
+    await db.run(
+      `UPDATE tip_results
+       SET home_goals = ?, away_goals = ?, outcome = ?, settled_at = datetime('now')
+       WHERE id = ?`,
+      row.home_goals,
+      row.away_goals,
+      outcome,
+      row.id
+    );
+    settled += 1;
+  }
+  return settled;
+}
+
+function comboKeyFromLegs(legs) {
+  return (legs || [])
+    .map((l) => Number(l.matchId ?? l.match_id))
+    .filter((id) => Number.isFinite(id) && id > 0)
+    .sort((a, b) => a - b)
+    .join('-');
+}
+
+/** Persist Cuotas combinadas (pending). Does not overwrite settled rows. */
+export async function upsertComboResults(db, combos) {
+  let n = 0;
+  for (const c of combos || []) {
+    const band = c.oddsBand != null ? String(c.oddsBand) : '';
+    if (!['2', '3', '4', '5'].includes(band)) continue;
+    const legs = c.legs || [];
+    const key = c.comboKey || comboKeyFromLegs(legs);
+    if (!key || !legs.length) continue;
+    const combined = Number(c.combinedOdds);
+    if (!Number.isFinite(combined) || combined <= 1) continue;
+    const legsJson = JSON.stringify(
+      legs.map((l) => ({
+        matchId: Number(l.matchId),
+        matchDate: l.matchDate || null,
+        league: l.league || null,
+        leagueId: l.leagueId ?? null,
+        leagueCountry: l.leagueCountry || null,
+        homeName: l.homeTeam?.name || l.homeName || null,
+        awayName: l.awayTeam?.name || l.awayName || null,
+        homeLogo: l.homeTeam?.logo || l.homeLogo || null,
+        awayLogo: l.awayTeam?.logo || l.awayLogo || null,
+        suggestedBet: l.suggestedBet || null,
+        tipOdds: l.tipOdds != null ? Number(l.tipOdds) : null,
+        confidenceScore: l.confidenceScore != null ? Number(l.confidenceScore) : null,
+      }))
+    );
+    await db.run(
+      `INSERT INTO combo_results (
+         combo_key, odds_band, combined_odds, avg_confidence, legs_json, outcome
+       ) VALUES (?, ?, ?, ?, ?, 'pending')
+       ON CONFLICT(combo_key, odds_band) DO UPDATE SET
+         combined_odds = CASE WHEN combo_results.outcome = 'pending' THEN excluded.combined_odds ELSE combo_results.combined_odds END,
+         avg_confidence = CASE WHEN combo_results.outcome = 'pending' THEN excluded.avg_confidence ELSE combo_results.avg_confidence END,
+         legs_json = CASE WHEN combo_results.outcome = 'pending' THEN excluded.legs_json ELSE combo_results.legs_json END`,
+      key,
+      band,
+      combined,
+      c.avgConfidence != null ? Number(c.avgConfidence) : null,
+      legsJson
+    );
+    n += 1;
+  }
+  return n;
+}
+
+async function matchExtrasForEval(db, matchId) {
+  const homeStat = await db.first(
+    `SELECT corners_for, yellows_for FROM team_stats WHERE match_id = ? AND is_home = 1`,
+    matchId
+  );
+  const awayStat = await db.first(
+    `SELECT corners_for, yellows_for FROM team_stats WHERE match_id = ? AND is_home = 0`,
+    matchId
+  );
+  let cornersTotal = null;
+  let yellowsTotal = null;
+  if (homeStat?.corners_for != null && awayStat?.corners_for != null) {
+    cornersTotal = Number(homeStat.corners_for) + Number(awayStat.corners_for);
+  }
+  if (homeStat?.yellows_for != null && awayStat?.yellows_for != null) {
+    yellowsTotal = Number(homeStat.yellows_for) + Number(awayStat.yellows_for);
+  }
+  return { cornersTotal, yellowsTotal };
+}
+
+/** Settle pending combinadas when every leg match is finished. */
+export async function settlePendingCombos(db, limit = 40) {
+  const pending = await db.all(
+    `SELECT id, legs_json FROM combo_results WHERE outcome = 'pending' ORDER BY created_at ASC LIMIT ?`,
+    Math.max(1, Number(limit) || 40)
+  );
+  let settled = 0;
+  for (const row of pending) {
+    let legs;
+    try {
+      legs = JSON.parse(row.legs_json || '[]');
+    } catch {
+      continue;
+    }
+    if (!Array.isArray(legs) || !legs.length) continue;
+    let allHit = true;
+    let anyPending = false;
+    let anyVoid = false;
+    for (const leg of legs) {
+      const mid = Number(leg.matchId);
+      if (!mid) {
+        anyVoid = true;
+        break;
+      }
+      const m = await db.first(
+        `SELECT status, home_goals, away_goals FROM matches WHERE id = ?`,
+        mid
+      );
+      if (!m || m.status !== 'finished' || m.home_goals == null || m.away_goals == null) {
+        anyPending = true;
+        break;
+      }
+      const extras = await matchExtrasForEval(db, mid);
+      const hit = evaluateSuggestedBet(leg.suggestedBet, m.home_goals, m.away_goals, extras);
+      if (hit == null) {
+        anyVoid = true;
+        break;
+      }
+      if (!hit) allHit = false;
+    }
+    if (anyPending) continue;
+    const outcome = anyVoid ? 'void' : allHit ? 'hit' : 'miss';
+    await db.run(
+      `UPDATE combo_results SET outcome = ?, settled_at = datetime('now') WHERE id = ?`,
+      outcome,
+      row.id
+    );
+    settled += 1;
+  }
+  return settled;
+}
+
+/**
+ * Rebuild combinadas from finished matches in a past window and settle immediately
+ * so Cuotas history is not empty on first deploy.
+ */
+export async function backfillHistoricalCombos(db, days = 14, perBand = 6) {
+  const d = Math.max(3, Math.min(60, Number(days) || 14));
+  const rows = await db.all(
+    `SELECT m.id AS match_id, m.match_date, m.home_goals, m.away_goals, m.status,
+            m.league_id, l.name AS league_name, l.country AS league_country,
+            ht.name AS home_name, at.name AS away_name,
+            ht.logo_url AS home_logo, at.logo_url AS away_logo,
+            p.*, o.home_odds, o.draw_odds, o.away_odds, o.over25_odds, o.under25_odds
+     FROM matches m
+     JOIN predictions p ON p.match_id = m.id
+     JOIN teams ht ON ht.id = m.home_team_id
+     JOIN teams at ON at.id = m.away_team_id
+     JOIN leagues l ON l.id = m.league_id
+     LEFT JOIN odds o ON o.match_id = m.id
+     WHERE m.status = 'finished'
+       AND m.home_goals IS NOT NULL
+       AND m.away_goals IS NOT NULL
+       AND DATE(m.match_date) >= DATE('now', ?)
+       AND DATE(m.match_date) <= DATE('now')
+     ORDER BY m.match_date DESC
+     LIMIT 80`,
+    `-${d} days`
+  );
+  if (!rows.length) return 0;
+
+  const candidates = [];
+  for (const r of rows) {
+    for (const band of ['2', '3', '4', '5']) {
+      const opts = comboOptsForBand(band);
+      const picked = pickLegForCombo(r, r, [r.suggested_bet, r.secondary_bet], {
+        tipMin: opts.tipMin,
+        tipMax: opts.tipMax,
+      });
+      if (!picked) continue;
+      candidates.push({
+        band,
+        leg: {
+          matchId: r.match_id,
+          matchDate: r.match_date,
+          league: r.league_name,
+          leagueId: r.league_id,
+          leagueCountry: r.league_country,
+          homeTeam: { name: r.home_name, logo: r.home_logo },
+          awayTeam: { name: r.away_name, logo: r.away_logo },
+          suggestedBet: picked.label,
+          tipOdds: picked.tipOdds,
+          confidenceScore: Number((picked.prob * 100).toFixed(2)),
+          _homeGoals: r.home_goals,
+          _awayGoals: r.away_goals,
+        },
+      });
+    }
+  }
+
+  let saved = 0;
+  for (const band of ['2', '3', '4', '5']) {
+    const opts = comboOptsForBand(band);
+    const legs = candidates.filter((c) => c.band === band).map((c) => c.leg);
+    // Unique by match
+    const seen = new Set();
+    const uniq = [];
+    for (const l of legs) {
+      if (seen.has(l.matchId)) continue;
+      seen.add(l.matchId);
+      uniq.push(l);
+    }
+    const built = buildCombos(uniq, band, {
+      ...opts,
+      limit: Math.max(1, Number(perBand) || 6),
+    });
+    for (const c of built) {
+      let allHit = true;
+      let anyVoid = false;
+      for (const leg of c.legs) {
+        const src = uniq.find((u) => u.matchId === leg.matchId);
+        if (!src) {
+          anyVoid = true;
+          break;
+        }
+        const extras = await matchExtrasForEval(db, leg.matchId);
+        const hit = evaluateSuggestedBet(
+          leg.suggestedBet,
+          src._homeGoals,
+          src._awayGoals,
+          extras
+        );
+        if (hit == null) {
+          anyVoid = true;
+          break;
+        }
+        if (!hit) allHit = false;
+      }
+      const outcome = anyVoid ? 'void' : allHit ? 'hit' : 'miss';
+      const key = comboKeyFromLegs(c.legs);
+      const legsJson = JSON.stringify(
+        c.legs.map((l) => ({
+          matchId: Number(l.matchId),
+          matchDate: l.matchDate || null,
+          league: l.league || null,
+          leagueId: l.leagueId ?? null,
+          leagueCountry: l.leagueCountry || null,
+          homeName: l.homeTeam?.name || null,
+          awayName: l.awayTeam?.name || null,
+          homeLogo: l.homeTeam?.logo || null,
+          awayLogo: l.awayTeam?.logo || null,
+          suggestedBet: l.suggestedBet || null,
+          tipOdds: l.tipOdds != null ? Number(l.tipOdds) : null,
+          confidenceScore: l.confidenceScore != null ? Number(l.confidenceScore) : null,
+        }))
+      );
+      await db.run(
+        `INSERT INTO combo_results (
+           combo_key, odds_band, combined_odds, avg_confidence, legs_json, outcome, settled_at
+         ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+         ON CONFLICT(combo_key, odds_band) DO UPDATE SET
+           outcome = CASE
+             WHEN combo_results.outcome IN ('hit','miss','void') THEN combo_results.outcome
+             ELSE excluded.outcome
+           END,
+           settled_at = CASE
+             WHEN combo_results.outcome IN ('hit','miss','void') THEN combo_results.settled_at
+             ELSE excluded.settled_at
+           END,
+           combined_odds = CASE WHEN combo_results.outcome = 'pending' THEN excluded.combined_odds ELSE combo_results.combined_odds END,
+           legs_json = CASE WHEN combo_results.outcome = 'pending' THEN excluded.legs_json ELSE combo_results.legs_json END`,
+        key,
+        band,
+        c.combinedOdds,
+        c.avgConfidence,
+        legsJson,
+        outcome
+      );
+      saved += 1;
+    }
+  }
+  return saved;
+}
+
+export async function getRecentComboResults(db, { band = null, limit = 40, win = null } = {}) {
+  const lim = Math.max(1, Math.min(80, Number(limit) || 40));
+  const params = [];
+  let windowSql = '1=1';
+  if (win?.mode === 'date' && win.date && /^\d{4}-\d{2}-\d{2}$/.test(win.date)) {
+    windowSql = `DATE(COALESCE(settled_at, created_at)) = DATE(?)`;
+    params.push(win.date);
+  } else if (win?.mode === 'days' || win?.mode === 'all') {
+    const days = Math.max(1, Number(win.days) || 14);
+    windowSql = `DATE(COALESCE(settled_at, created_at)) >= DATE('now', ?) AND DATE(COALESCE(settled_at, created_at)) <= DATE('now')`;
+    params.push(`-${days} days`);
+  } else if (win) {
+    windowSql = `DATE(COALESCE(settled_at, created_at)) >= DATE('now', '-30 days')`;
+  }
+  let bandSql = '';
+  if (band && ['2', '3', '4', '5'].includes(String(band))) {
+    bandSql = 'AND odds_band = ?';
+    params.push(String(band));
+  }
+  params.push(lim);
+  const rows = await db.all(
+    `SELECT id, combo_key, odds_band, combined_odds, avg_confidence, legs_json,
+            outcome, settled_at, created_at
+     FROM combo_results
+     WHERE outcome IN ('hit', 'miss') AND ${windowSql} ${bandSql}
+     ORDER BY COALESCE(settled_at, created_at) DESC
+     LIMIT ?`,
+    ...params
+  );
+  return rows.map((r) => {
+    let legs = [];
+    try {
+      legs = JSON.parse(r.legs_json || '[]');
+    } catch {
+      legs = [];
+    }
+    return {
+      id: r.id,
+      comboKey: r.combo_key,
+      oddsBand: r.odds_band,
+      combinedOdds: r.combined_odds != null ? Number(r.combined_odds) : null,
+      avgConfidence: r.avg_confidence != null ? Number(r.avg_confidence) : null,
+      outcome: r.outcome,
+      settledAt: r.settled_at,
+      createdAt: r.created_at,
+      legs,
+    };
+  });
+}
+
+/** Hit/miss/pending for combinadas by band (ledger), optional calendar window on settled/created. */
+export async function getComboBandStats(db, win = null) {
+  let windowSql = '1=1';
+  const params = [];
+  if (win?.mode === 'date' && win.date && /^\d{4}-\d{2}-\d{2}$/.test(win.date)) {
+    windowSql = `(
+      (outcome IN ('hit','miss','void') AND DATE(COALESCE(settled_at, created_at)) = DATE(?))
+      OR (outcome = 'pending' AND DATE(created_at) = DATE(?))
+    )`;
+    params.push(win.date, win.date);
+  } else if (win?.mode === 'days' || win?.mode === 'all') {
+    const days = Math.max(1, Number(win.days) || 14);
+    windowSql = `DATE(COALESCE(settled_at, created_at)) >= DATE('now', ?) AND DATE(COALESCE(settled_at, created_at)) <= DATE('now')`;
+    params.push(`-${days} days`);
+  } else if (win) {
+    windowSql = `DATE(COALESCE(settled_at, created_at)) >= DATE('now', '-30 days')`;
+  }
+  const rows = await db.all(
+    `SELECT odds_band AS band,
+       SUM(CASE WHEN outcome = 'hit' THEN 1 ELSE 0 END) AS hits,
+       SUM(CASE WHEN outcome = 'miss' THEN 1 ELSE 0 END) AS misses,
+       SUM(CASE WHEN outcome = 'pending' THEN 1 ELSE 0 END) AS pending
+     FROM combo_results
+     WHERE odds_band IN ('2','3','4','5') AND ${windowSql}
+     GROUP BY odds_band`,
+    ...params
+  );
+  const map = new Map(rows.map((r) => [String(r.band), r]));
+  const out = {};
+  for (const band of ['2', '3', '4', '5']) {
+    const r = map.get(band);
+    const h = Number(r?.hits || 0);
+    const m = Number(r?.misses || 0);
+    const d = h + m;
+    out[band] = {
+      hits: h,
+      misses: m,
+      pending: Number(r?.pending || 0),
+      hitRate: d ? Number((h / d).toFixed(4)) : null,
+    };
+  }
+  return out;
+}
+
+/**
+ * Hit rates for mid-odds single markets (calibration only — not Cuotas chip %).
+ */
+export async function computeMidBandMarketPerf(db, windowSql, windowParams) {
+  const empty = () => ({ hits: 0, misses: 0, pending: 0 });
+  const stats = {
+    '2': empty(),
+    '3': empty(),
+    '4': empty(),
+    '5': empty(),
+  };
+
+  const rows = await db.all(
+    `SELECT p.*, m.id AS match_id, m.match_date, m.home_goals, m.away_goals, m.status,
+            ht.name AS home_name, at.name AS away_name, l.name AS league_name,
+            l.country AS league_country,
+            ht.logo_url AS home_logo, at.logo_url AS away_logo,
+            o.home_odds, o.draw_odds, o.away_odds, o.over25_odds, o.under25_odds
+     FROM matches m
+     JOIN predictions p ON p.match_id = m.id
+     JOIN teams ht ON ht.id = m.home_team_id
+     JOIN teams at ON at.id = m.away_team_id
+     JOIN leagues l ON l.id = m.league_id
+     LEFT JOIN odds o ON o.match_id = m.id
+     WHERE m.status = 'finished'
+       AND m.home_goals IS NOT NULL
+       AND m.away_goals IS NOT NULL
+       AND ${windowSql}
+     ORDER BY m.match_date DESC
+     LIMIT 120`,
+    ...windowParams
+  );
+  if (!rows.length) return { stats };
+
+  const matchIds = rows.map((r) => r.match_id);
+  const placeholders = matchIds.map(() => '?').join(',');
+  const teamStats = await db.all(
+    `SELECT match_id, is_home, corners_for, yellows_for
+     FROM team_stats
+     WHERE match_id IN (${placeholders})`,
+    ...matchIds
+  );
+  const extrasByMatch = new Map();
+  for (const s of teamStats) {
+    let ex = extrasByMatch.get(s.match_id);
+    if (!ex) {
+      ex = { home: null, away: null };
+      extrasByMatch.set(s.match_id, ex);
+    }
+    if (Number(s.is_home) === 1) ex.home = s;
+    else ex.away = s;
+  }
+
+  for (const r of rows) {
+    const pair = extrasByMatch.get(r.match_id);
+    let cornersTotal = null;
+    let yellowsTotal = null;
+    if (pair?.home?.corners_for != null && pair?.away?.corners_for != null) {
+      cornersTotal = Number(pair.home.corners_for) + Number(pair.away.corners_for);
+    }
+    if (pair?.home?.yellows_for != null && pair?.away?.yellows_for != null) {
+      yellowsTotal = Number(pair.home.yellows_for) + Number(pair.away.yellows_for);
+    }
+    const preferred = [r.suggested_bet, r.secondary_bet].filter(Boolean);
+    for (const band of ['2', '3', '4', '5']) {
+      const picked = pickMarketForOddsBand(r, r, band, preferred);
+      if (!picked?.label) continue;
+      const hit = evaluateSuggestedBet(picked.label, r.home_goals, r.away_goals, {
+        cornersTotal,
+        yellowsTotal,
+      });
+      if (hit == null) continue;
+      if (hit) stats[band].hits += 1;
+      else stats[band].misses += 1;
+    }
+  }
+
+  return { stats };
+}
+
+export async function getTipPerformance(db, win = null) {
+  // Settle pending tips/combos on read; do NOT invent historical combos here.
+  try {
+    await backfillPendingTips(db, 80);
+    await settlePendingTips(db, 200);
+    await backfillTipOddsBands(db, 300);
+    await settlePendingCombos(db, 40);
+  } catch (_) {
+    /* keep read path available even if maintenance fails */
+  }
+
+  let windowSql = '1=1';
+  const windowParams = [];
+  let windowLabel = 'histórico';
+  if (win?.mode === 'date' && win.date && /^\d{4}-\d{2}-\d{2}$/.test(win.date)) {
+    windowSql = `DATE(m.match_date) = DATE(?)`;
+    windowParams.push(win.date);
+    windowLabel = win.date;
+  } else if (win?.mode === 'days' || win?.mode === 'all') {
+    const days = Math.max(1, Number(win.days) || 14);
+    // Past only: hit rates for last N days (cartelera 5d/14d still uses upcoming elsewhere)
+    windowSql = `DATE(m.match_date) >= DATE('now', ?) AND DATE(m.match_date) <= DATE('now')`;
+    windowParams.push(`-${days} days`);
+    windowLabel = `últimos ${days} días`;
+  } else {
+    // Default for badge / no query: last 30 days of tips by match date
+    windowSql = `DATE(m.match_date) >= DATE('now', '-30 days')`;
+    windowLabel = 'últimos 30 días';
+  }
+
+  const totals = await db.first(
+    `SELECT
+       SUM(CASE WHEN tr.outcome = 'hit' THEN 1 ELSE 0 END) AS hits,
+       SUM(CASE WHEN tr.outcome = 'miss' THEN 1 ELSE 0 END) AS misses,
+       SUM(CASE WHEN tr.outcome = 'pending' THEN 1 ELSE 0 END) AS pending,
+       SUM(CASE WHEN tr.outcome = 'void' THEN 1 ELSE 0 END) AS voids
+     FROM tip_results tr
+     JOIN matches m ON m.id = tr.match_id
+     WHERE ${windowSql}`,
+    ...windowParams
+  );
+  const hits = Number(totals?.hits || 0);
+  const misses = Number(totals?.misses || 0);
+  const decided = hits + misses;
+  const byFamily = await db.all(
+    `SELECT
+       CASE
+         WHEN tr.suggested_bet IN ('HOME_WIN','DRAW','AWAY_WIN') THEN '1X2'
+         WHEN tr.suggested_bet IN ('OVER_15','UNDER_15','OVER_25','UNDER_25','OVER_35','UNDER_35','BTTS_YES','BTTS_NO') THEN 'goles'
+         WHEN tr.suggested_bet IN ('CORNERS_OVER_95','CORNERS_UNDER_95') THEN 'corners'
+         WHEN tr.suggested_bet IN ('CARDS_OVER_35','CARDS_UNDER_35','CARDS_OVER_45','CARDS_UNDER_45') THEN 'cards'
+         ELSE 'otros'
+       END AS family,
+       SUM(CASE WHEN tr.outcome = 'hit' THEN 1 ELSE 0 END) AS hits,
+       SUM(CASE WHEN tr.outcome = 'miss' THEN 1 ELSE 0 END) AS misses
+     FROM tip_results tr
+     JOIN matches m ON m.id = tr.match_id
+     WHERE tr.outcome IN ('hit', 'miss') AND ${windowSql}
+     GROUP BY family`,
+    ...windowParams
+  );
+  // Band 1 (Cortas) = official tips; bands 2–5 = combinadas ledger.
+  const byOddsBandRaw = await db.all(
+    `SELECT
+       CASE
+         WHEN tr.tip_odds > 1 AND tr.tip_odds < 1.7 THEN '1'
+         WHEN tr.tip_odds >= 1.7 AND tr.tip_odds < 2.5 THEN '2'
+         WHEN tr.tip_odds >= 2.5 AND tr.tip_odds < 3.5 THEN '3'
+         WHEN tr.tip_odds >= 3.5 AND tr.tip_odds < 4.5 THEN '4'
+         WHEN tr.tip_odds >= 4.5 AND tr.tip_odds <= 6.5 THEN '5'
+         WHEN tr.odds_band IN ('1','2','3','4','5') THEN tr.odds_band
+         ELSE NULL
+       END AS band,
+       SUM(CASE WHEN tr.outcome = 'hit' THEN 1 ELSE 0 END) AS hits,
+       SUM(CASE WHEN tr.outcome = 'miss' THEN 1 ELSE 0 END) AS misses,
+       SUM(CASE WHEN tr.outcome = 'pending' THEN 1 ELSE 0 END) AS pending
+     FROM tip_results tr
+     JOIN matches m ON m.id = tr.match_id
+     WHERE ${windowSql}
+     GROUP BY band
+     HAVING band IS NOT NULL`,
+    ...windowParams
+  );
+  const tipBandMap = new Map(byOddsBandRaw.map((r) => [String(r.band), r]));
+  let comboBands = {};
+  try {
+    comboBands = await getComboBandStats(db, win);
+  } catch (_) {
+    comboBands = {};
+  }
+  const byOddsBand = STAT_ODDS_BANDS.map((band) => {
+    if (band === '1') {
+      const r = tipBandMap.get('1');
+      const h = Number(r?.hits || 0);
+      const m = Number(r?.misses || 0);
+      const d = h + m;
+      return {
+        band,
+        hits: h,
+        misses: m,
+        pending: Number(r?.pending || 0),
+        hitRate: d ? Number((h / d).toFixed(4)) : null,
+        source: 'tips',
+      };
+    }
+    const c = comboBands[band] || { hits: 0, misses: 0, pending: 0, hitRate: null };
+    return {
+      band,
+      hits: Number(c.hits || 0),
+      misses: Number(c.misses || 0),
+      pending: Number(c.pending || 0),
+      hitRate: c.hitRate,
+      source: 'combos',
+    };
+  });
+  const recentTips = await db.all(
+    `SELECT tr.suggested_bet, tr.confidence_score, tr.outcome, tr.home_goals, tr.away_goals,
+            tr.settled_at, tr.tip_odds, tr.odds_band, m.match_date,
+            ht.name AS home_name, at.name AS away_name, l.name AS league_name,
+            l.country AS league_country,
+            ht.logo_url AS home_logo, at.logo_url AS away_logo
+     FROM tip_results tr
+     JOIN matches m ON m.id = tr.match_id
+     JOIN teams ht ON ht.id = m.home_team_id
+     JOIN teams at ON at.id = m.away_team_id
+     JOIN leagues l ON l.id = m.league_id
+     WHERE tr.outcome IN ('hit', 'miss') AND ${windowSql}
+     ORDER BY tr.settled_at DESC
+     LIMIT 60`,
+    ...windowParams
+  );
+  const recent = recentTips;
+  let recentCombos = [];
+  try {
+    recentCombos = await getRecentComboResults(db, { limit: 40, win });
+  } catch (_) {
+    recentCombos = [];
+  }
+  return {
+    hits,
+    misses,
+    pending: Number(totals?.pending || 0),
+    voids: Number(totals?.voids || 0),
+    decided,
+    hitRate: decided ? Number((hits / decided).toFixed(4)) : null,
+    windowLabel,
+    byFamily: byFamily.map((r) => {
+      const h = Number(r.hits || 0);
+      const m = Number(r.misses || 0);
+      const d = h + m;
+      return {
+        family: r.family,
+        hits: h,
+        misses: m,
+        hitRate: d ? Number((h / d).toFixed(4)) : null,
+      };
+    }),
+    byOddsBand,
+    recent,
+    recentCombos,
+  };
+}
+
+export async function updateTeamLogo(db, teamId, logoUrl) {
+  if (!teamId || !logoUrl) return;
+  await db.run(
+    `UPDATE teams SET logo_url = COALESCE(logo_url, ?) WHERE id = ? AND (logo_url IS NULL OR logo_url = '')`,
+    logoUrl,
+    teamId
+  );
+}
+
+/** Fill missing logos for all teams (club CDN map or flag). Returns count updated. */
+export async function backfillMissingTeamLogos(db, resolveLogo) {
+  const rows = await db.all(
+    `SELECT id, name, logo_url FROM teams WHERE logo_url IS NULL OR logo_url = ''`
+  );
+  if (!rows.length) return 0;
+  const stmts = [];
+  for (const r of rows) {
+    const url = resolveLogo(r.name);
+    if (!url) continue;
+    stmts.push({
+      sql: `UPDATE teams SET logo_url = ? WHERE id = ? AND (logo_url IS NULL OR logo_url = '')`,
+      params: [url, r.id],
+    });
+  }
+  for (let i = 0; i < stmts.length; i += 40) {
+    await db.batch(stmts.slice(i, i + 40));
+  }
+  return stmts.length;
+}
+
+export async function getUpcomingForOddsEnrichment(db, limit = 40, days = 14) {
+  const endModifier = `+${Number(days)} days`;
+  return db.all(
+    `SELECT m.id, m.match_date, m.api_id AS match_api_id,
+            l.api_id AS league_api_id,
+            ht.id AS home_team_id, at.id AS away_team_id,
+            ht.name AS home_name, at.name AS away_name,
+            ht.logo_url AS home_logo, at.logo_url AS away_logo
+     FROM matches m
+     JOIN leagues l ON l.id = m.league_id
+     JOIN teams ht ON ht.id = m.home_team_id
+     JOIN teams at ON at.id = m.away_team_id
+     WHERE date(m.match_date) >= date('now')
+       AND date(m.match_date) <= date('now', ?)
+       AND m.status IN ('scheduled', 'live')
+       ${ALLOWED_LEAGUE_SQL}
+     ORDER BY m.match_date ASC
+     LIMIT ?`,
+    endModifier,
+    limit
+  );
+}
+
+/** Finished matches missing corners or yellows — for AF statistics enrich. */
+export async function getFinishedForStatsEnrichment(db, limit = 120, lookbackDays = 90) {
+  const startModifier = `-${Number(lookbackDays)} days`;
+  return db.all(
+    `SELECT m.id, m.match_date, m.home_goals, m.away_goals,
+            l.api_id AS league_api_id,
+            ht.name AS home_name, at.name AS away_name,
+            ht.id AS home_team_id, at.id AS away_team_id
+     FROM matches m
+     JOIN leagues l ON l.id = m.league_id
+     JOIN teams ht ON ht.id = m.home_team_id
+     JOIN teams at ON at.id = m.away_team_id
+     LEFT JOIN team_stats hs ON hs.match_id = m.id AND hs.team_id = ht.id
+     WHERE m.status = 'finished'
+       AND m.home_goals IS NOT NULL
+       AND date(m.match_date) >= date('now', ?)
+       AND date(m.match_date) < date('now')
+       AND (hs.corners_for IS NULL OR hs.yellows_for IS NULL)
+     ORDER BY m.match_date DESC
+     LIMIT ?`,
+    startModifier,
+    limit
+  );
+}
+
+export async function countOddsRows(db) {
+  const row = await db.first('SELECT COUNT(DISTINCT match_id) AS c FROM odds');
+  return Number(row?.c || 0);
+}
+
+export async function countStatsWithCorners(db) {
+  const row = await db.first(
+    `SELECT COUNT(*) AS c FROM team_stats WHERE corners_for IS NOT NULL`
+  );
+  return Number(row?.c || 0);
+}
+
+export async function countStatsWithYellows(db) {
+  const row = await db.first(
+    `SELECT COUNT(*) AS c FROM team_stats WHERE yellows_for IS NOT NULL`
+  );
+  return Number(row?.c || 0);
+}
